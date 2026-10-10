@@ -1336,7 +1336,7 @@ function streamCursorWithWireMode(
 				onTodoSnapshot: options?.execHandlers?.todoSync?.bind(options.execHandlers),
 				onToolResult: toolResult => {
 					// Hosted completions are decoded synchronously. Track their async
-					// result/steering boundary before any later exec can start.
+					// result/steering boundary before a later exec or permission reply.
 					const result = onToolResult(toolResult);
 					const completion = Promise.resolve(result).then(
 						() => {},
@@ -1439,9 +1439,13 @@ function streamCursorWithWireMode(
 						// entry and the call is left unpaired. Awaited after
 						// `h2Completion` below.
 						const dispatch = (async () => {
-							if (serverMessage.message.case === "execServerMessage" && hostedResultCallbacks.size > 0) {
+							if (
+								(serverMessage.message.case === "execServerMessage" ||
+									serverMessage.message.case === "interactionQuery") &&
+								hostedResultCallbacks.size > 0
+							) {
 								await Promise.all(hostedResultCallbacks);
-								if (yieldedForSteering) return;
+								if (yieldedForSteering || options?.signal?.aborted) return;
 							}
 							await handleServerMessage(
 								serverMessage,
@@ -1545,7 +1549,8 @@ function streamCursorWithWireMode(
 			flushOpenToolCalls(output, stream, state);
 			// Flushing server-owned calls creates result callbacks after the dispatch
 			// drain. Settle their claims before the agent snapshots queued input.
-			await Promise.all(hostedResultCallbacks);
+			await drainInFlightDispatches();
+			if (options?.signal?.aborted) throw new AIError.AbortError();
 			if (yieldedForSteering && conversationId) cursorConversations.delete(conversationId);
 
 			calculateCost(model, output.usage, output.timestamp);
@@ -1763,7 +1768,7 @@ function streamCursorWithWireMode(
 				endCurrentTextBlock(output, stream, openBlockState);
 				endCurrentThinkingBlock(output, stream, openBlockState);
 				flushOpenToolCalls(output, stream, openBlockState);
-				await Promise.all(hostedResultCallbacks);
+				await drainInFlightDispatches();
 				if (yieldedForSteering && conversationId) cursorConversations.delete(conversationId);
 			}
 			const result = await AIError.finalize(error, { api: model.api, signal: options?.signal });

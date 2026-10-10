@@ -5,7 +5,11 @@ import type { ToolResultMessage, UserMessage } from "@oh-my-pi/pi-ai/types";
 import { LiveSteeringChannel } from "../../agent/src/live-steering";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
+	AgentClientMessageSchema,
 	AgentServerMessageSchema,
+	FetchArgsSchema,
+	InteractionQuerySchema,
+	WebFetchRequestQuerySchema,
 	ConnectScmArgsSchema,
 	ConnectScmToolCallSchema,
 	ToolCallSchema,
@@ -16,7 +20,7 @@ import {
 	ReadArgsSchema,
 	TurnEndedUpdateSchema,
 } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
-import { create, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
+import { create, fromBinary, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 
 function frame(data: Uint8Array): Buffer {
 	const result = Buffer.alloc(5 + data.length);
@@ -203,7 +207,21 @@ it.each(["text", "image", "hosted"])("yields a five-tool Cursor run at step two 
 	}
 });
 
-it.each(["ended", "interrupted", "ordered"])("settles delayed hosted steering before %s finalization", async mode => {
+it.each([
+	"ended",
+	"interrupted",
+	"ordered",
+	"query",
+	"ended-abort",
+	"interrupted-abort",
+	"ended-hook-abort",
+	"interrupted-hook-abort",
+])("settles delayed hosted steering before %s finalization", async mode => {
+	const interrupted = mode.startsWith("interrupted");
+	const abort = mode.endsWith("abort");
+	const holdHook = mode.includes("hook");
+	const controller = new AbortController();
+	let approvals = 0;
 	const sessions = new Set<http2.ServerHttp2Session>();
 	const server = http2.createServer();
 	server.on("session", session => {
@@ -232,6 +250,17 @@ it.each(["ended", "interrupted", "ordered"])("settles delayed hosted steering be
 	});
 	server.on("stream", (socket: http2.ServerHttp2Stream) => {
 		socket.respond({ ":status": 200, "content-type": "application/connect+proto" });
+		socket.on("data", chunk => {
+			// Decode client replies separately from the first run request.
+			let offset = 0;
+			while (offset + 5 <= chunk.length) {
+				const length = chunk.readUInt32BE(offset + 1);
+				if (offset + 5 + length > chunk.length) break;
+				const message = fromBinary(AgentClientMessageSchema, chunk.subarray(offset + 5, offset + 5 + length));
+				if (message.message.case === "interactionResponse") approvals++;
+				offset += 5 + length;
+			}
+		});
 		socket.once("data", () => {
 			const frames: Buffer[] = [];
 			for (const callId of mode === "ordered" ? ["A", "B"] : ["A"]) {
@@ -251,7 +280,7 @@ it.each(["ended", "interrupted", "ordered"])("settles delayed hosted steering be
 						},
 					}),
 				];
-				if (mode === "ordered")
+				if (mode === "ordered" || mode === "query")
 					updates.push(
 						create(InteractionUpdateSchema, {
 							message: {
@@ -270,7 +299,35 @@ it.each(["ended", "interrupted", "ordered"])("settles delayed hosted steering be
 						),
 					);
 			}
-			if (mode !== "interrupted")
+			if (mode === "query") {
+				frames.push(
+					frame(
+						toBinary(
+							AgentServerMessageSchema,
+							create(AgentServerMessageSchema, {
+								message: {
+									case: "interactionQuery",
+									value: create(InteractionQuerySchema, {
+										id: 18,
+										query: {
+											case: "webFetchRequestQuery",
+											value: create(WebFetchRequestQuerySchema, {
+												args: create(FetchArgsSchema, {
+													url: "https://example.com",
+													toolCallId: "fetch-next",
+												}),
+											}),
+										},
+									}),
+								},
+							}),
+						),
+					),
+				);
+				socket.write(Buffer.concat(frames));
+				return;
+			}
+			if (!interrupted)
 				frames.push(
 					frame(
 						toBinary(
@@ -315,9 +372,13 @@ it.each(["ended", "interrupted", "ordered"])("settles delayed hosted steering be
 			{
 				apiKey: "test-token",
 				transport: "http2",
-				signal: AbortSignal.timeout(5000),
+				signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]),
 				liveSteering: steering,
 				onToolResult: async toolResult => {
+					if (holdHook) {
+						conversionStarted.resolve();
+						await releaseConversion.promise;
+					}
 					pending.push({ role: "user", content: toolResult.toolCallId, timestamp: 2 });
 					return toolResult;
 				},
@@ -329,6 +390,22 @@ it.each(["ended", "interrupted", "ordered"])("settles delayed hosted steering be
 				return message;
 			});
 		await conversionStarted.promise;
+		if (abort) {
+			controller.abort();
+			const checkpoint = Promise.withResolvers<void>();
+			setImmediate(checkpoint.resolve);
+			await checkpoint.promise;
+			expect(finished).toBe(true);
+			expect((await result).stopReason).toBe("aborted");
+			return;
+		}
+		if (mode === "query") {
+			// A transport round trip places our observation after the client has
+			// processed the chunk containing both completion and permission query.
+			const roundTrip = Promise.withResolvers<void>();
+			for (const session of sessions) session.ping(error => (error ? roundTrip.reject(error) : roundTrip.resolve()));
+			await roundTrip.promise;
+		}
 		// B is allowed to finish first; it must still wait behind A's settlement.
 		releaseLaterConversion.resolve();
 		// Let all callbacks and stream finalization reach the explicit conversion gate.
@@ -336,6 +413,7 @@ it.each(["ended", "interrupted", "ordered"])("settles delayed hosted steering be
 		setImmediate(checkpoint.resolve);
 		await checkpoint.promise;
 		expect(finished).toBe(false);
+		expect(approvals).toBe(0);
 		expect(converted).toEqual(["A"]);
 		expect(steering.deferred).toEqual([]);
 		releaseConversion.resolve();
@@ -345,6 +423,7 @@ it.each(["ended", "interrupted", "ordered"])("settles delayed hosted steering be
 			mode === "ordered" ? ["A", "B"] : ["A"],
 		);
 		expect(steering.accepted).toEqual([]);
+		expect(approvals).toBe(0);
 	} finally {
 		releaseConversion.resolve();
 		releaseLaterConversion.resolve();
