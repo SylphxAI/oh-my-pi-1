@@ -1050,7 +1050,8 @@ function streamCursorWithWireMode(
 		// transport fails, and the error path finalizes the synthesized call just
 		// like the success path does.
 		const inFlightDispatches = new Set<Promise<void>>();
-		const hostedResultCallbacks = new Set<Promise<void>>();
+		const toolResultCallbacks = new Set<Promise<void>>();
+		let finalized = false;
 		// A dispatch can spawn another (a handler that decodes a nested frame), so
 		// re-check rather than awaiting one snapshot. Each dispatch already
 		// swallows its own rejection, so this only waits.
@@ -1282,14 +1283,16 @@ function streamCursorWithWireMode(
 				// Serialize claim AND settlement: a later hosted completion must not
 				// dequeue input while an earlier message is still being converted.
 				const completion = toolResultTail.then(async () => {
+					if (finalized || options?.signal?.aborted) return toolResult;
 					const result = (await options?.onToolResult?.(toolResult)) ?? toolResult;
-					if (!yieldedForSteering && options?.liveSteering) {
+					if (!finalized && !options?.signal?.aborted && !yieldedForSteering && options?.liveSteering) {
 						const claim = await options.liveSteering.claim(steeringSignal);
 						if (claim || options.liveSteering.hasDeferred) {
 							// Cursor owns the tool loop inside this stream. Yield before replying
 							// with this result, so it cannot start the next tool before the agent
 							// injects queued input. Keep the completed tool's local result paired.
 							claim?.reject();
+							if (finalized || options?.signal?.aborted) return result;
 							yieldedForSteering = true;
 							output.stopReason = "toolUse";
 							h2Settled = true;
@@ -1301,8 +1304,16 @@ function streamCursorWithWireMode(
 				});
 				toolResultTail = completion.then(
 					() => {},
-					() => {},
+					error => log("error", "toolResult", { error: String(error) }),
 				);
+				// Local execs and hosted completions share the same dispatch boundary.
+				const settled = toolResultTail;
+				toolResultCallbacks.add(settled);
+				inFlightDispatches.add(settled);
+				void settled.finally(() => {
+					toolResultCallbacks.delete(settled);
+					inFlightDispatches.delete(settled);
+				});
 				return completion;
 			};
 
@@ -1334,22 +1345,7 @@ function streamCursorWithWireMode(
 					if (!firstTokenTime) firstTokenTime = performance.now();
 				},
 				onTodoSnapshot: options?.execHandlers?.todoSync?.bind(options.execHandlers),
-				onToolResult: toolResult => {
-					// Hosted completions are decoded synchronously. Track their async
-					// result/steering boundary before a later exec or permission reply.
-					const result = onToolResult(toolResult);
-					const completion = Promise.resolve(result).then(
-						() => {},
-						error => log("error", "hostedToolResult", { error: String(error) }),
-					);
-					hostedResultCallbacks.add(completion);
-					inFlightDispatches.add(completion);
-					void completion.finally(() => {
-						hostedResultCallbacks.delete(completion);
-						inFlightDispatches.delete(completion);
-					});
-					return result;
-				},
+				onToolResult,
 			};
 			openBlockState = state;
 
@@ -1367,7 +1363,7 @@ function streamCursorWithWireMode(
 			const resultTransport = runTransport;
 			const resultWriter: CursorMessageWriter = {
 				write(frame) {
-					if (yieldedForSteering) return;
+					if (finalized || yieldedForSteering || options?.signal?.aborted) return;
 					progressVersion++;
 					resultTransport.write(frame);
 				},
@@ -1442,9 +1438,9 @@ function streamCursorWithWireMode(
 							if (
 								(serverMessage.message.case === "execServerMessage" ||
 									serverMessage.message.case === "interactionQuery") &&
-								hostedResultCallbacks.size > 0
+								toolResultCallbacks.size > 0
 							) {
-								await Promise.all(hostedResultCallbacks);
+								await Promise.all(toolResultCallbacks);
 								if (yieldedForSteering || options?.signal?.aborted) return;
 							}
 							await handleServerMessage(
@@ -1816,6 +1812,7 @@ function streamCursorWithWireMode(
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		} finally {
+			finalized = true;
 			const log = await debugResponseLogPromise;
 			await log?.close();
 			if (heartbeatTimer) {

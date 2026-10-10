@@ -212,6 +212,9 @@ it.each([
 	"interrupted",
 	"ordered",
 	"query",
+	"local-exec",
+	"local-query",
+	"late-abort",
 	"ended-abort",
 	"interrupted-abort",
 	"ended-hook-abort",
@@ -222,6 +225,10 @@ it.each([
 	const holdHook = mode.includes("hook");
 	const controller = new AbortController();
 	let approvals = 0;
+	let runs = 0;
+	const local = mode.startsWith("local");
+	const sink: string[] = [];
+	const executed: string[] = [];
 	const sessions = new Set<http2.ServerHttp2Session>();
 	const server = http2.createServer();
 	server.on("session", session => {
@@ -249,6 +256,7 @@ it.each([
 		},
 	});
 	server.on("stream", (socket: http2.ServerHttp2Stream) => {
+		const continuation = ++runs > 1;
 		socket.respond({ ":status": 200, "content-type": "application/connect+proto" });
 		socket.on("data", (chunk: Buffer) => {
 			// Decode client replies separately from the first run request.
@@ -261,9 +269,38 @@ it.each([
 				offset += 5 + length;
 			}
 		});
-		socket.once("data", () => {
+		socket.once("data", async () => {
 			const frames: Buffer[] = [];
-			for (const callId of mode === "ordered" ? ["A", "B"] : ["A"]) {
+			if (local) {
+				socket.write(
+					frame(
+						toBinary(
+							AgentServerMessageSchema,
+							create(AgentServerMessageSchema, {
+								message: {
+									case: "execServerMessage",
+									value: create(ExecServerMessageSchema, {
+										id: 1,
+										execId: "local-A",
+										message: {
+											case: "readArgs",
+											value: create(ReadArgsSchema, { path: "/A", toolCallId: "A" }),
+										},
+									}),
+								},
+							}),
+						),
+					),
+				);
+				await conversionStarted.promise;
+			}
+			for (const callId of continuation
+				? ["C"]
+				: local
+					? []
+					: mode === "ordered" || mode === "late-abort"
+						? ["A", "B"]
+						: ["A"]) {
 				const toolCall = create(ToolCallSchema, {
 					tool: {
 						case: "connectScmToolCall",
@@ -280,7 +317,7 @@ it.each([
 						},
 					}),
 				];
-				if (mode === "ordered" || mode === "query")
+				if (continuation || mode === "ordered" || mode === "query" || mode === "late-abort")
 					updates.push(
 						create(InteractionUpdateSchema, {
 							message: {
@@ -299,7 +336,31 @@ it.each([
 						),
 					);
 			}
-			if (mode === "query") {
+			if (mode === "local-exec") {
+				frames.push(
+					frame(
+						toBinary(
+							AgentServerMessageSchema,
+							create(AgentServerMessageSchema, {
+								message: {
+									case: "execServerMessage",
+									value: create(ExecServerMessageSchema, {
+										id: 2,
+										execId: "local-B",
+										message: {
+											case: "readArgs",
+											value: create(ReadArgsSchema, { path: "/B", toolCallId: "B" }),
+										},
+									}),
+								},
+							}),
+						),
+					),
+				);
+				socket.write(Buffer.concat(frames));
+				return;
+			}
+			if (mode === "query" || mode === "local-query") {
 				frames.push(
 					frame(
 						toBinary(
@@ -374,7 +435,21 @@ it.each([
 				transport: "http2",
 				signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]),
 				liveSteering: steering,
+				execHandlers: {
+					read: async args => {
+						executed.push(args.toolCallId);
+						return {
+							role: "toolResult",
+							toolCallId: args.toolCallId,
+							toolName: "read",
+							content: [{ type: "text", text: args.path }],
+							isError: false,
+							timestamp: 1,
+						};
+					},
+				},
 				onToolResult: async toolResult => {
+					sink.push(toolResult.toolCallId);
 					if (holdHook) {
 						conversionStarted.resolve();
 						await releaseConversion.promise;
@@ -397,9 +472,32 @@ it.each([
 			await checkpoint.promise;
 			expect(finished).toBe(true);
 			expect((await result).stopReason).toBe("aborted");
+			if (mode === "late-abort") {
+				const next = await streamCursor(
+					model,
+					{ messages: [{ role: "user", content: "continue", timestamp: 3 }] },
+					{
+						apiKey: "test-token",
+						transport: "http2",
+						signal: AbortSignal.timeout(2000),
+						onToolResult: toolResult => {
+							sink.push(toolResult.toolCallId);
+							return toolResult;
+						},
+					},
+				).result();
+				expect(next.stopReason).toBe("stop");
+				expect(sink).toEqual(["A", "C"]);
+				releaseConversion.resolve();
+				releaseLaterConversion.resolve();
+				const settled = Promise.withResolvers<void>();
+				setImmediate(settled.resolve);
+				await settled.promise;
+				expect(sink).toEqual(["A", "C"]);
+			}
 			return;
 		}
-		if (mode === "query") {
+		if (mode === "query" || local) {
 			// A transport round trip places our observation after the client has
 			// processed the chunk containing both completion and permission query.
 			const roundTrip = Promise.withResolvers<void>();
@@ -414,6 +512,7 @@ it.each([
 		await checkpoint.promise;
 		expect(finished).toBe(false);
 		expect(approvals).toBe(0);
+		expect(executed).toEqual(local ? ["A"] : []);
 		expect(converted).toEqual(["A"]);
 		expect(steering.deferred).toEqual([]);
 		releaseConversion.resolve();
