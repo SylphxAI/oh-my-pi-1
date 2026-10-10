@@ -1,10 +1,16 @@
 import { expect, it } from "bun:test";
 import * as http2 from "node:http2";
 import { streamCursor } from "@oh-my-pi/pi-ai/providers/cursor";
-import type { ToolResultMessage } from "@oh-my-pi/pi-ai/types";
+import type { ToolResultMessage, UserMessage } from "@oh-my-pi/pi-ai/types";
+import { LiveSteeringChannel } from "../../agent/src/live-steering";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
 	AgentServerMessageSchema,
+	ConnectScmArgsSchema,
+	ConnectScmToolCallSchema,
+	ToolCallSchema,
+	ToolCallStartedUpdateSchema,
+	ToolCallCompletedUpdateSchema,
 	ExecServerMessageSchema,
 	InteractionUpdateSchema,
 	ReadArgsSchema,
@@ -19,7 +25,7 @@ function frame(data: Uint8Array): Buffer {
 	return result;
 }
 
-it("yields a five-tool Cursor run after step two when steering is queued", async () => {
+it.each(["text", "image", "hosted"])("yields a five-tool Cursor run at step two with %s steering", async mode => {
 	const sessions = new Set<http2.ServerHttp2Session>();
 	const server = http2.createServer();
 	server.on("session", session => {
@@ -31,6 +37,60 @@ it("yields a five-tool Cursor run after step two when steering is queued", async
 		let step = 0;
 		socket.on("data", () => {
 			step++;
+			if (mode === "hosted" && step === 2) {
+				const toolCall = create(ToolCallSchema, {
+					tool: {
+						case: "connectScmToolCall",
+						value: create(ConnectScmToolCallSchema, {
+							args: create(ConnectScmArgsSchema, { toolCallId: "call-2" }),
+						}),
+					},
+				});
+				const updates = [
+					create(InteractionUpdateSchema, {
+						message: {
+							case: "toolCallStarted",
+							value: create(ToolCallStartedUpdateSchema, { callId: "call-2", toolCall }),
+						},
+					}),
+					create(InteractionUpdateSchema, {
+						message: {
+							case: "toolCallCompleted",
+							value: create(ToolCallCompletedUpdateSchema, { callId: "call-2", toolCall }),
+						},
+					}),
+				];
+				const nextExec = create(AgentServerMessageSchema, {
+					message: {
+						case: "execServerMessage",
+						value: create(ExecServerMessageSchema, {
+							id: 3,
+							execId: "exec-3",
+							message: {
+								case: "readArgs",
+								value: create(ReadArgsSchema, { path: "/step-3", toolCallId: "call-3" }),
+							},
+						}),
+					},
+				});
+				socket.write(
+					Buffer.concat([
+						...updates.map(value =>
+							frame(
+								toBinary(
+									AgentServerMessageSchema,
+									create(AgentServerMessageSchema, {
+										message: { case: "interactionUpdate", value },
+									}),
+								),
+							),
+						),
+						frame(toBinary(AgentServerMessageSchema, nextExec)),
+					]),
+				);
+				step = 3;
+				return;
+			}
 			const message =
 				step <= 5
 					? create(AgentServerMessageSchema, {
@@ -79,7 +139,28 @@ it("yields a five-tool Cursor run after step two when steering is queued", async
 	const executed: string[] = [];
 	const results: ToolResultMessage[] = [];
 	let queued = false;
-	let deferred = 0;
+	const steeringMessage: UserMessage = {
+		role: "user",
+		content:
+			mode === "image" ? [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }] : "Telegram steer at step two",
+		timestamp: 2,
+	};
+	const steering = new LiveSteeringChannel({
+		wait: async () => {},
+		take: async () => {
+			if (!queued) return [];
+			queued = false;
+			return [steeringMessage];
+		},
+		toProvider: async () => {
+			if (mode === "hosted") {
+				const conversion = Promise.withResolvers<void>();
+				setImmediate(conversion.resolve);
+				await conversion.promise;
+			}
+			return mode === "image" ? undefined : [steeringMessage];
+		},
+	});
 	try {
 		const response = streamCursor(
 			model,
@@ -88,22 +169,7 @@ it("yields a five-tool Cursor run after step two when steering is queued", async
 				apiKey: "test-token",
 				transport: "http2",
 				signal: AbortSignal.timeout(2000),
-				liveSteering: {
-					wait: async () => {},
-					claim: async () =>
-						queued
-							? {
-									messages: [{ role: "user", content: "Telegram steer at step two", timestamp: 2 }],
-									accept: () => {
-										throw new Error("steering must reach the next model request");
-									},
-									reject: () => {
-										queued = false;
-										deferred++;
-									},
-								}
-							: undefined,
-				},
+				liveSteering: steering,
 				execHandlers: {
 					read: async args => {
 						executed.push(args.path);
@@ -120,15 +186,17 @@ it("yields a five-tool Cursor run after step two when steering is queued", async
 				},
 				onToolResult: async result => {
 					results.push(result);
+					if (mode === "hosted" && result.toolCallId === "call-2") queued = true;
 					return result;
 				},
 			},
 		);
 		const result = await response.result();
 		expect(result.stopReason).toBe("toolUse");
-		expect(executed).toEqual(["/step-1:raw", "/step-2:raw"]);
+		expect(executed).toEqual(mode === "hosted" ? ["/step-1:raw"] : ["/step-1:raw", "/step-2:raw"]);
 		expect(results.map(result => result.toolCallId)).toEqual(["call-1", "call-2"]);
-		expect(deferred).toBe(1);
+		expect(steering.deferred).toEqual([steeringMessage]);
+		expect(steering.accepted).toEqual([]);
 	} finally {
 		for (const session of sessions) session.destroy();
 		server.close();

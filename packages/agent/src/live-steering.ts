@@ -36,6 +36,10 @@ export class LiveSteeringChannel implements LiveSteering {
 		this.#queue = queue;
 	}
 
+	get hasDeferred(): boolean {
+		return this.deferred.length > 0;
+	}
+
 	wait(signal: AbortSignal): Promise<void> {
 		// Once input is deferred, later input must follow it at the boundary;
 		// delivering it live would reorder the user's messages.

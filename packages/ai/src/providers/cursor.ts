@@ -1276,15 +1276,16 @@ function streamCursorWithWireMode(
 			usageState = retryContext?.usageState ?? { sawTokenDelta: false };
 
 			const steeringSignal = options?.signal ?? new AbortController().signal;
+			const hostedResultCallbacks = new Set<Promise<void>>();
 			const onToolResult: CursorToolResultHandler = async toolResult => {
 				const result = (await options?.onToolResult?.(toolResult)) ?? toolResult;
 				if (!yieldedForSteering && options?.liveSteering) {
 					const claim = await options.liveSteering.claim(steeringSignal);
-					if (claim) {
+					if (claim || options.liveSteering.hasDeferred) {
 						// Cursor owns the tool loop inside this stream. Yield before replying
 						// with this result, so it cannot start the next tool before the agent
 						// injects queued input. Keep the completed tool's local result paired.
-						claim.reject();
+						claim?.reject();
 						yieldedForSteering = true;
 						output.stopReason = "toolUse";
 						h2Settled = true;
@@ -1323,7 +1324,22 @@ function streamCursorWithWireMode(
 					if (!firstTokenTime) firstTokenTime = performance.now();
 				},
 				onTodoSnapshot: options?.execHandlers?.todoSync?.bind(options.execHandlers),
-				onToolResult,
+				onToolResult: toolResult => {
+					// Hosted completions are decoded synchronously. Track their async
+					// result/steering boundary before any later exec can start.
+					const result = onToolResult(toolResult);
+					const completion = Promise.resolve(result).then(
+						() => {},
+						error => log("error", "hostedToolResult", { error: String(error) }),
+					);
+					hostedResultCallbacks.add(completion);
+					inFlightDispatches.add(completion);
+					void completion.finally(() => {
+						hostedResultCallbacks.delete(completion);
+						inFlightDispatches.delete(completion);
+					});
+					return result;
+				},
 			};
 			openBlockState = state;
 
@@ -1412,21 +1428,27 @@ function streamCursorWithWireMode(
 						// drains its Cursor result buffer before the handler reserved its
 						// entry and the call is left unpaired. Awaited after
 						// `h2Completion` below.
-						const dispatch = handleServerMessage(
-							serverMessage,
-							output,
-							stream,
-							state,
-							blobStore,
-							serverMessage.message.case === "kvServerMessage" ? runTransport! : resultWriter,
-							options?.execHandlers,
-							onToolResult,
-							usageState!,
-							requestContextTools,
-							requestContextRules,
-							onConversationCheckpoint,
-							options?.externalToolExecutor,
-						).catch(error => {
+						const dispatch = (async () => {
+							if (serverMessage.message.case === "execServerMessage" && hostedResultCallbacks.size > 0) {
+								await Promise.all(hostedResultCallbacks);
+								if (yieldedForSteering) return;
+							}
+							await handleServerMessage(
+								serverMessage,
+								output,
+								stream,
+								state,
+								blobStore,
+								serverMessage.message.case === "kvServerMessage" ? runTransport! : resultWriter,
+								options?.execHandlers,
+								onToolResult,
+								usageState!,
+								requestContextTools,
+								requestContextRules,
+								onConversationCheckpoint,
+								options?.externalToolExecutor,
+							);
+						})().catch(error => {
 							log("error", "handleServerMessage", { error: String(error) });
 						});
 						inFlightDispatches.add(dispatch);
