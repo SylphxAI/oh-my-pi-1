@@ -202,3 +202,153 @@ it.each(["text", "image", "hosted"])("yields a five-tool Cursor run at step two 
 		server.close();
 	}
 });
+
+it.each(["ended", "interrupted", "ordered"])("settles delayed hosted steering before %s finalization", async mode => {
+	const sessions = new Set<http2.ServerHttp2Session>();
+	const server = http2.createServer();
+	server.on("session", session => {
+		sessions.add(session);
+		session.on("close", () => sessions.delete(session));
+	});
+	const conversionStarted = Promise.withResolvers<void>();
+	const releaseConversion = Promise.withResolvers<void>();
+	const releaseLaterConversion = Promise.withResolvers<void>();
+	const pending: UserMessage[] = [];
+	const converted: string[] = [];
+	const steering = new LiveSteeringChannel({
+		wait: async () => {},
+		take: async () => pending.splice(0, 1),
+		toProvider: async messages => {
+			const message = messages[0] as UserMessage;
+			converted.push(String(message.content));
+			if (message.content === "A") {
+				conversionStarted.resolve();
+				await releaseConversion.promise;
+			} else {
+				await releaseLaterConversion.promise;
+			}
+			return messages as UserMessage[];
+		},
+	});
+	server.on("stream", (socket: http2.ServerHttp2Stream) => {
+		socket.respond({ ":status": 200, "content-type": "application/connect+proto" });
+		socket.once("data", () => {
+			const frames: Buffer[] = [];
+			for (const callId of mode === "ordered" ? ["A", "B"] : ["A"]) {
+				const toolCall = create(ToolCallSchema, {
+					tool: {
+						case: "connectScmToolCall",
+						value: create(ConnectScmToolCallSchema, {
+							args: create(ConnectScmArgsSchema, { toolCallId: callId }),
+						}),
+					},
+				});
+				const updates = [
+					create(InteractionUpdateSchema, {
+						message: {
+							case: "toolCallStarted",
+							value: create(ToolCallStartedUpdateSchema, { callId, toolCall }),
+						},
+					}),
+				];
+				if (mode === "ordered")
+					updates.push(
+						create(InteractionUpdateSchema, {
+							message: {
+								case: "toolCallCompleted",
+								value: create(ToolCallCompletedUpdateSchema, { callId, toolCall }),
+							},
+						}),
+					);
+				for (const value of updates)
+					frames.push(
+						frame(
+							toBinary(
+								AgentServerMessageSchema,
+								create(AgentServerMessageSchema, { message: { case: "interactionUpdate", value } }),
+							),
+						),
+					);
+			}
+			if (mode !== "interrupted")
+				frames.push(
+					frame(
+						toBinary(
+							AgentServerMessageSchema,
+							create(AgentServerMessageSchema, {
+								message: {
+									case: "interactionUpdate",
+									value: create(InteractionUpdateSchema, {
+										message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
+									}),
+								},
+							}),
+						),
+					),
+				);
+			socket.end(Buffer.concat(frames));
+		});
+	});
+	const listening = Promise.withResolvers<void>();
+	server.once("listening", listening.resolve);
+	server.listen(0, "127.0.0.1");
+	await listening.promise;
+	const address = server.address();
+	if (!address || typeof address === "string") throw new Error("missing fixture address");
+	const model = buildModel({
+		id: "cursor-finalization-fixture",
+		name: "Cursor finalization fixture",
+		api: "cursor-agent",
+		provider: "cursor",
+		baseUrl: `http://127.0.0.1:${address.port}`,
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1000,
+		maxTokens: 100,
+	});
+	try {
+		let finished = false;
+		const result = streamCursor(
+			model,
+			{ messages: [{ role: "user", content: "hosted tools", timestamp: 1 }] },
+			{
+				apiKey: "test-token",
+				transport: "http2",
+				signal: AbortSignal.timeout(5000),
+				liveSteering: steering,
+				onToolResult: async toolResult => {
+					pending.push({ role: "user", content: toolResult.toolCallId, timestamp: 2 });
+					return toolResult;
+				},
+			},
+		)
+			.result()
+			.then(message => {
+				finished = true;
+				return message;
+			});
+		await conversionStarted.promise;
+		// B is allowed to finish first; it must still wait behind A's settlement.
+		releaseLaterConversion.resolve();
+		// Let all callbacks and stream finalization reach the explicit conversion gate.
+		const checkpoint = Promise.withResolvers<void>();
+		setImmediate(checkpoint.resolve);
+		await checkpoint.promise;
+		expect(finished).toBe(false);
+		expect(converted).toEqual(["A"]);
+		expect(steering.deferred).toEqual([]);
+		releaseConversion.resolve();
+		const message = await result;
+		expect(message.stopReason).toBe(mode === "interrupted" ? "error" : "toolUse");
+		expect([...steering.deferred, ...pending].map(message => message.content)).toEqual(
+			mode === "ordered" ? ["A", "B"] : ["A"],
+		);
+		expect(steering.accepted).toEqual([]);
+	} finally {
+		releaseConversion.resolve();
+		releaseLaterConversion.resolve();
+		for (const session of sessions) session.destroy();
+		server.close();
+	}
+});

@@ -1050,6 +1050,7 @@ function streamCursorWithWireMode(
 		// transport fails, and the error path finalizes the synthesized call just
 		// like the success path does.
 		const inFlightDispatches = new Set<Promise<void>>();
+		const hostedResultCallbacks = new Set<Promise<void>>();
 		// A dispatch can spawn another (a handler that decodes a nested frame), so
 		// re-check rather than awaiting one snapshot. Each dispatch already
 		// swallows its own rejection, so this only waits.
@@ -1276,24 +1277,33 @@ function streamCursorWithWireMode(
 			usageState = retryContext?.usageState ?? { sawTokenDelta: false };
 
 			const steeringSignal = options?.signal ?? new AbortController().signal;
-			const hostedResultCallbacks = new Set<Promise<void>>();
-			const onToolResult: CursorToolResultHandler = async toolResult => {
-				const result = (await options?.onToolResult?.(toolResult)) ?? toolResult;
-				if (!yieldedForSteering && options?.liveSteering) {
-					const claim = await options.liveSteering.claim(steeringSignal);
-					if (claim || options.liveSteering.hasDeferred) {
-						// Cursor owns the tool loop inside this stream. Yield before replying
-						// with this result, so it cannot start the next tool before the agent
-						// injects queued input. Keep the completed tool's local result paired.
-						claim?.reject();
-						yieldedForSteering = true;
-						output.stopReason = "toolUse";
-						h2Settled = true;
-						h2Completion.resolve();
-						runTransport?.close();
+			let toolResultTail: Promise<void> = Promise.resolve();
+			const onToolResult: CursorToolResultHandler = toolResult => {
+				// Serialize claim AND settlement: a later hosted completion must not
+				// dequeue input while an earlier message is still being converted.
+				const completion = toolResultTail.then(async () => {
+					const result = (await options?.onToolResult?.(toolResult)) ?? toolResult;
+					if (!yieldedForSteering && options?.liveSteering) {
+						const claim = await options.liveSteering.claim(steeringSignal);
+						if (claim || options.liveSteering.hasDeferred) {
+							// Cursor owns the tool loop inside this stream. Yield before replying
+							// with this result, so it cannot start the next tool before the agent
+							// injects queued input. Keep the completed tool's local result paired.
+							claim?.reject();
+							yieldedForSteering = true;
+							output.stopReason = "toolUse";
+							h2Settled = true;
+							h2Completion.resolve();
+							runTransport?.close();
+						}
 					}
-				}
-				return result;
+					return result;
+				});
+				toolResultTail = completion.then(
+					() => {},
+					() => {},
+				);
+				return completion;
 			};
 
 			const state: BlockState = {
@@ -1530,15 +1540,13 @@ function streamCursorWithWireMode(
 			// unpaired and stripped from every rebuilt transcript. Each dispatch
 			// already swallows its own rejection, so this only waits.
 			await drainInFlightDispatches();
-			if (yieldedForSteering && conversationId) {
-				// The server never received the last result. Its checkpoint would replay
-				// that tool; rebuild the next request from the paired local transcript.
-				cursorConversations.delete(conversationId);
-			}
-
 			endCurrentTextBlock(output, stream, state);
 			endCurrentThinkingBlock(output, stream, state);
 			flushOpenToolCalls(output, stream, state);
+			// Flushing server-owned calls creates result callbacks after the dispatch
+			// drain. Settle their claims before the agent snapshots queued input.
+			await Promise.all(hostedResultCallbacks);
+			if (yieldedForSteering && conversationId) cursorConversations.delete(conversationId);
 
 			calculateCost(model, output.usage, output.timestamp);
 
@@ -1755,6 +1763,8 @@ function streamCursorWithWireMode(
 				endCurrentTextBlock(output, stream, openBlockState);
 				endCurrentThinkingBlock(output, stream, openBlockState);
 				flushOpenToolCalls(output, stream, openBlockState);
+				await Promise.all(hostedResultCallbacks);
+				if (yieldedForSteering && conversationId) cursorConversations.delete(conversationId);
 			}
 			const result = await AIError.finalize(error, { api: model.api, signal: options?.signal });
 			// #8345: a server-side per-conversation rejection surfaces as a bare
