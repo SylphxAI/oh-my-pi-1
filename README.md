@@ -636,6 +636,10 @@ For a non-interactive smoke check:
 bun dev -- --version
 ```
 
+### Fork pull-request checks
+
+The `Fork tests` workflow runs Cursor provider/error, agent steering, and coding-agent retry recovery tests on pull requests and merge groups. It installs frozen Bun dependencies and the checksum-pinned 18.8.7 Linux native addon; native changes still require the upstream source-build checks. Pull requests test their exact head, while merge groups test the combined commit. Hosted jobs run only in public repositories.
+
 ### Debug Command
 
 `/debug` opens tools for debugging, reporting, and profiling.
