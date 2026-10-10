@@ -250,7 +250,7 @@ it.each([
 	});
 	server.on("stream", (socket: http2.ServerHttp2Stream) => {
 		socket.respond({ ":status": 200, "content-type": "application/connect+proto" });
-		socket.on("data", chunk => {
+		socket.on("data", (chunk: Buffer) => {
 			// Decode client replies separately from the first run request.
 			let offset = 0;
 			while (offset + 5 <= chunk.length) {
