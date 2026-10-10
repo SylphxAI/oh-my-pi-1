@@ -1,0 +1,36 @@
+name: Fork tests
+
+on:
+   pull_request:
+   merge_group:
+   push:
+      branches: [main]
+      paths: [".github/workflows/fork-tests.yml"]
+
+permissions:
+   contents: read
+
+jobs:
+   cursor-tests:
+      # Standard hosted runners are free only for public repositories.
+      if: github.event.repository.private == false
+      runs-on: ubuntu-24.04
+      timeout-minutes: 15
+      steps:
+         - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+           with:
+              # Review and merge admission require proof for the exact PR head.
+              ref: ${{ github.event.pull_request.head.sha || github.sha }}
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+           with:
+              bun-version-file: package.json
+         - run: bun install --frozen-lockfile
+         - name: Install released native test dependency
+           run: |
+              curl -fsSL https://registry.npmjs.org/@oh-my-pi/pi-natives-linux-x64/-/pi-natives-linux-x64-18.8.7.tgz -o "$RUNNER_TEMP/natives.tgz"
+              echo "bdf75d42a75f5e6c168d77188bfa8a47c55c9e607e98923ed2ba42e0d9a9d162  $RUNNER_TEMP/natives.tgz" | sha256sum -c -
+              tar -xzf "$RUNNER_TEMP/natives.tgz" --strip-components=1 -C packages/natives/native package/pi_natives.linux-x64-baseline.node package/pi_natives.linux-x64-modern.node
+         - name: Test Cursor provider and agent steering
+           run: bun test --timeout 120000 packages/ai/test/cursor-*.test.ts packages/ai/test/error-*.test.ts packages/agent/test
+         - name: Test coding-agent retry recovery
+           run: bun test --timeout 120000 packages/coding-agent/test/agent-session-retry-cap.test.ts packages/coding-agent/test/agent-session-retry-recovery.test.ts
