@@ -1109,6 +1109,17 @@ function streamCursorWithWireMode(
 		// and pair the blocks it left open, and `state` itself is scoped to the
 		// try below.
 		let openBlockState: BlockState | undefined;
+		// Abort cannot wait behind an abandoned hook/conversion. Reserve synthetic
+		// interrupted results in the agent sink now, before its transcript closes;
+		// ordinary queued callbacks still retain the abort/finalized guard.
+		const onInterruptedToolResult: CursorToolResultHandler = async toolResult => {
+			try {
+				return (await options?.onToolResult?.(toolResult)) ?? toolResult;
+			} catch (error) {
+				log("error", "toolResult", { error: String(error) });
+				return toolResult;
+			}
+		};
 		const settleH2 = (error?: unknown): void => {
 			if (h2Settled) return;
 			h2Settled = true;
@@ -1436,12 +1447,15 @@ function streamCursorWithWireMode(
 						// `h2Completion` below.
 						const dispatch = (async () => {
 							if (
-								(serverMessage.message.case === "execServerMessage" ||
-									serverMessage.message.case === "interactionQuery") &&
-								toolResultCallbacks.size > 0
+								serverMessage.message.case === "execServerMessage" ||
+								serverMessage.message.case === "interactionQuery"
 							) {
-								await Promise.all(toolResultCallbacks);
-								if (yieldedForSteering || options?.signal?.aborted) return;
+								// Later completions in the same chunk can queue more callbacks
+								// while this dispatch waits. Reach a fixed point before proceeding.
+								while (toolResultCallbacks.size > 0) {
+									await Promise.all(toolResultCallbacks);
+									if (yieldedForSteering || options?.signal?.aborted) return;
+								}
 							}
 							await handleServerMessage(
 								serverMessage,
@@ -1542,7 +1556,12 @@ function streamCursorWithWireMode(
 			await drainInFlightDispatches();
 			endCurrentTextBlock(output, stream, state);
 			endCurrentThinkingBlock(output, stream, state);
-			flushOpenToolCalls(output, stream, state);
+			flushOpenToolCalls(
+				output,
+				stream,
+				state,
+				options?.signal?.aborted ? onInterruptedToolResult : state.onToolResult,
+			);
 			// Flushing server-owned calls creates result callbacks after the dispatch
 			// drain. Settle their claims before the agent snapshots queued input.
 			await drainInFlightDispatches();
@@ -1764,7 +1783,12 @@ function streamCursorWithWireMode(
 			if (openBlockState) {
 				endCurrentTextBlock(output, stream, openBlockState);
 				endCurrentThinkingBlock(output, stream, openBlockState);
-				flushOpenToolCalls(output, stream, openBlockState);
+				flushOpenToolCalls(
+					output,
+					stream,
+					openBlockState,
+					options?.signal?.aborted ? onInterruptedToolResult : openBlockState.onToolResult,
+				);
 				await drainInFlightDispatches();
 				if (yieldedForSteering && conversationId) cursorConversations.delete(conversationId);
 			}
@@ -4585,6 +4609,7 @@ export function flushOpenToolCalls(
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 	state: BlockState,
+	onToolResult: CursorToolResultHandler | undefined = state.onToolResult,
 ): void {
 	const openBlocks = new Set<ToolCallState>(state.openToolCalls.values());
 	if (state.currentToolCall) openBlocks.add(state.currentToolCall);
@@ -4598,7 +4623,7 @@ export function flushOpenToolCalls(
 		const kind = block[kStreamingBlockKind];
 		if (kind === "connect-scm" || kind === "todo" || kind === "cursor-edit" || kind === "web-fetch") {
 			if (!(kind === "cursor-edit" && state.pairedEditToolCallIds?.has(block.id))) {
-				state.onToolResult?.({
+				onToolResult?.({
 					role: "toolResult",
 					toolCallId: block.id,
 					toolName: block.name,

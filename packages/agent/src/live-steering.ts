@@ -89,6 +89,10 @@ export class LiveSteeringChannel implements LiveSteering {
 			logger.debug("Live steering conversion failed", {
 				error: error instanceof Error ? error.message : String(error),
 			});
+		} finally {
+			// Cancellation restores input only while conversion owns it. Once handed
+			// to the provider, its submission acknowledgement owns settlement.
+			signal.removeEventListener("abort", onAbort);
 		}
 		if (!providerMessages || settled) {
 			reject();

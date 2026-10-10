@@ -14,6 +14,7 @@ import type {
 import type { LiveSteering, Message } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { CodexSteerPump, type CodexSteerAck } from "../../ai/src/providers/openai-codex/live-steering";
 import { LiveSteeringChannel } from "../src/live-steering";
 import { createUserMessage } from "./helpers";
 
@@ -128,6 +129,41 @@ function userText(message: AgentMessage): string {
 }
 
 describe("agent loop live steering", () => {
+	it("records a submitted Codex steer accepted after finish stops claiming", async () => {
+		const steer = createUserMessage("use tabs");
+		const queue = [steer];
+		const channel = new LiveSteeringChannel({
+			wait: async () => {},
+			take: async () => queue.splice(0),
+			toProvider: async () => [steer],
+		});
+		const submitted = Promise.withResolvers<void>();
+		const acknowledgement = Promise.withResolvers<CodexSteerAck>();
+		const pump = new CodexSteerPump(
+			channel,
+			{
+				steer: async () => {
+					submitted.resolve();
+					return acknowledgement.promise;
+				},
+			},
+			() => [{ role: "user", content: "use tabs" }],
+		);
+		pump.start("response-1");
+		await submitted.promise;
+		const finishing = pump.finish();
+		try {
+			expect(channel.deferred).toEqual([]);
+		} finally {
+			acknowledgement.resolve({ accepted: true, id: "steer-1" });
+			await finishing;
+		}
+		const outcome = await finishing;
+		expect(outcome.accepted.map(input => input.id)).toEqual(["steer-1"]);
+		expect(channel.accepted).toEqual([steer]);
+		expect(channel.deferred).toEqual([]);
+		expect(queue).toEqual([]);
+	});
 	it("records accepted steering right after the steered response and holds later input for the next boundary", async () => {
 		let claimedView: string[] | undefined;
 		const { contexts, transcript } = await runSteered(async (live, queue) => {

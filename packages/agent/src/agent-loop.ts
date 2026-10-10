@@ -39,6 +39,7 @@ import {
 	copyCursorExecResolved,
 	getStreamingPartialJson,
 	kCursorExecResolved,
+	kStreamingBlockKind,
 } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { schemaDefinesProperty } from "@oh-my-pi/pi-ai/utils/schema/json-schema-validator";
 import { stamp } from "@oh-my-pi/pi-ai/utils/schema/stamps";
@@ -2386,6 +2387,21 @@ async function streamAssistantResponse(
 						case "toolcall_delta":
 						case "toolcall_end":
 							if (partialMessage) {
+								if (event.type === "toolcall_start") {
+									const toolCall = event.partial.content[event.contentIndex];
+									const kind = (toolCall as { [kStreamingBlockKind]?: string })?.[kStreamingBlockKind];
+									if (
+										toolCall?.type === "toolCall" &&
+										(kind === "connect-scm" ||
+											kind === "todo" ||
+											kind === "web-fetch" ||
+											kind === "cursor-edit")
+									) {
+										// Cursor pairs these server-owned calls during abort finalization.
+										// The abort race may stop reading before their toolcall_end arrives.
+										completedToolCallIds.add(toolCall.id);
+									}
+								}
 								if (event.type === "toolcall_start" && speculationCoordinator && speculationPlansFromStream) {
 									// Stream sessions plan from pre-transform arguments, exactly like
 									// direct candidates (see admitFinalized below): with a transformer
@@ -2755,9 +2771,9 @@ function emitAbortedAssistantMessage(
 				errorId,
 				timestamp: Date.now(),
 			};
-	// Only tool calls that reached `toolcall_end` survive abort/error replay. A
-	// labeled user interrupt still surfaces through `errorMessage`, but partial
-	// tool arguments are unsafe to keep and can carry incomplete provider IDs.
+	// Only finalized tool arguments and Cursor's hosted calls (paired by provider
+	// finalization) survive abort/error replay. A labeled user interrupt still
+	// surfaces through `errorMessage`; unfinished model-owned calls are discarded.
 	const retained = retainCompletedToolCalls(base, completedToolCallIds);
 	const scopedAbort = toolScopedAbortReason(requestSignal);
 	const toolCallAbortMessages = scopedAbort ? buildToolCallAbortMessages(retained, scopedAbort) : undefined;

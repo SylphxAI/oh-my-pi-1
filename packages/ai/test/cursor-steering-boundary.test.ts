@@ -1,6 +1,9 @@
 import { expect, it } from "bun:test";
 import * as http2 from "node:http2";
 import { streamCursor } from "@oh-my-pi/pi-ai/providers/cursor";
+import { Agent } from "../../agent/src/agent";
+import type { Message } from "../src/types";
+import { createMockModel } from "../src/providers/mock";
 import type { ToolResultMessage, UserMessage } from "@oh-my-pi/pi-ai/types";
 import { LiveSteeringChannel } from "../../agent/src/live-steering";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -215,6 +218,8 @@ it.each([
 	"query",
 	"local-exec",
 	"local-query",
+	"fixed-exec",
+	"fixed-query",
 	"late-abort",
 	"ended-abort",
 	"interrupted-abort",
@@ -229,6 +234,9 @@ it.each([
 	let approvals = 0;
 	let runs = 0;
 	const local = mode.startsWith("local");
+	const fixed = mode.startsWith("fixed");
+	const firstHookStarted = Promise.withResolvers<void>();
+	const releaseFirstHook = Promise.withResolvers<void>();
 	const sink: string[] = [];
 	const executed: string[] = [];
 	const sessions = new Set<http2.ServerHttp2Session>();
@@ -298,11 +306,13 @@ it.each([
 			}
 			for (const callId of continuation
 				? ["C"]
-				: local
-					? []
-					: mode === "ordered" || mode === "late-abort"
-						? ["A", "B"]
-						: ["A"]) {
+				: fixed
+					? ["A", "C"]
+					: local
+						? []
+						: mode === "ordered" || mode === "late-abort"
+							? ["A", "B"]
+							: ["A"]) {
 				const toolCall = create(ToolCallSchema, {
 					tool: {
 						case: "connectScmToolCall",
@@ -321,6 +331,7 @@ it.each([
 				];
 				if (
 					continuation ||
+					fixed ||
 					mode === "ordered" ||
 					mode === "query" ||
 					mode === "late-abort" ||
@@ -344,55 +355,55 @@ it.each([
 						),
 					);
 			}
-			if (mode === "local-exec") {
-				frames.push(
-					frame(
-						toBinary(
-							AgentServerMessageSchema,
-							create(AgentServerMessageSchema, {
-								message: {
-									case: "execServerMessage",
-									value: create(ExecServerMessageSchema, {
-										id: 2,
-										execId: "local-B",
-										message: {
-											case: "readArgs",
-											value: create(ReadArgsSchema, { path: "/B", toolCallId: "B" }),
-										},
-									}),
-								},
-							}),
-						),
+			if (mode === "local-exec" || mode === "fixed-exec") {
+				const boundary = frame(
+					toBinary(
+						AgentServerMessageSchema,
+						create(AgentServerMessageSchema, {
+							message: {
+								case: "execServerMessage",
+								value: create(ExecServerMessageSchema, {
+									id: 2,
+									execId: "local-B",
+									message: {
+										case: "readArgs",
+										value: create(ReadArgsSchema, { path: "/B", toolCallId: "B" }),
+									},
+								}),
+							},
+						}),
 					),
 				);
+				if (fixed) frames.splice(2, 0, boundary);
+				else frames.push(boundary);
 				socket.write(Buffer.concat(frames));
 				return;
 			}
-			if (mode === "query" || mode === "local-query") {
-				frames.push(
-					frame(
-						toBinary(
-							AgentServerMessageSchema,
-							create(AgentServerMessageSchema, {
-								message: {
-									case: "interactionQuery",
-									value: create(InteractionQuerySchema, {
-										id: 18,
-										query: {
-											case: "webFetchRequestQuery",
-											value: create(WebFetchRequestQuerySchema, {
-												args: create(FetchArgsSchema, {
-													url: "https://example.com",
-													toolCallId: "fetch-next",
-												}),
+			if (mode === "query" || mode === "local-query" || mode === "fixed-query") {
+				const boundary = frame(
+					toBinary(
+						AgentServerMessageSchema,
+						create(AgentServerMessageSchema, {
+							message: {
+								case: "interactionQuery",
+								value: create(InteractionQuerySchema, {
+									id: 18,
+									query: {
+										case: "webFetchRequestQuery",
+										value: create(WebFetchRequestQuerySchema, {
+											args: create(FetchArgsSchema, {
+												url: "https://example.com",
+												toolCallId: "fetch-next",
 											}),
-										},
-									}),
-								},
-							}),
-						),
+										}),
+									},
+								}),
+							},
+						}),
 					),
 				);
+				if (fixed) frames.splice(2, 0, boundary);
+				else frames.push(boundary);
 				socket.write(Buffer.concat(frames));
 				return;
 			}
@@ -476,11 +487,17 @@ it.each([
 				},
 				onToolResult: async toolResult => {
 					sink.push(toolResult.toolCallId);
+					if (fixed && toolResult.toolCallId === "A") {
+						firstHookStarted.resolve();
+						await releaseFirstHook.promise;
+						return toolResult;
+					}
+					if (fixed && toolResult.toolCallId !== "C") return toolResult;
 					if (holdHook) {
 						conversionStarted.resolve();
 						await releaseConversion.promise;
 					}
-					pending.push({ role: "user", content: toolResult.toolCallId, timestamp: 2 });
+					pending.push({ role: "user", content: fixed ? "A" : toolResult.toolCallId, timestamp: 2 });
 					return toolResult;
 				},
 			},
@@ -490,6 +507,10 @@ it.each([
 				finished = true;
 				return message;
 			});
+		if (fixed) {
+			await firstHookStarted.promise;
+			releaseFirstHook.resolve();
+		}
 		await conversionStarted.promise;
 		if (abort) {
 			controller.abort();
@@ -527,7 +548,7 @@ it.each([
 			}
 			return;
 		}
-		if (mode === "query" || local) {
+		if (mode === "query" || local || fixed) {
 			// A transport round trip places our observation after the client has
 			// processed the chunk containing both completion and permission query.
 			const roundTrip = Promise.withResolvers<void>();
@@ -555,8 +576,117 @@ it.each([
 		expect(approvals).toBe(0);
 		if (mode === "interrupted-checkpoint") expect(runs).toBe(1);
 	} finally {
+		releaseFirstHook.resolve();
 		releaseConversion.resolve();
 		releaseLaterConversion.resolve();
+		for (const session of sessions) session.destroy();
+		server.close();
+	}
+});
+
+it("pairs an open hosted call on cancellation in the agent transcript and continuation", async () => {
+	const sessions = new Set<http2.ServerHttp2Session>();
+	const server = http2.createServer();
+	server.on("session", session => {
+		sessions.add(session);
+		session.on("close", () => sessions.delete(session));
+	});
+	server.on("stream", (socket: http2.ServerHttp2Stream) => {
+		socket.respond({ ":status": 200, "content-type": "application/connect+proto" });
+		socket.once("data", () => {
+			const toolCall = create(ToolCallSchema, {
+				tool: {
+					case: "connectScmToolCall",
+					value: create(ConnectScmToolCallSchema, {
+						args: create(ConnectScmArgsSchema, { toolCallId: "open-hosted" }),
+					}),
+				},
+			});
+			socket.write(
+				frame(
+					toBinary(
+						AgentServerMessageSchema,
+						create(AgentServerMessageSchema, {
+							message: {
+								case: "interactionUpdate",
+								value: create(InteractionUpdateSchema, {
+									message: {
+										case: "toolCallStarted",
+										value: create(ToolCallStartedUpdateSchema, {
+											callId: "open-hosted",
+											toolCall,
+										}),
+									},
+								}),
+							},
+						}),
+					),
+				),
+			);
+		});
+	});
+	const listening = Promise.withResolvers<void>();
+	server.once("listening", listening.resolve);
+	server.listen(0, "127.0.0.1");
+	await listening.promise;
+	const address = server.address();
+	if (!address || typeof address === "string") throw new Error("missing fixture address");
+	const model = buildModel({
+		id: "cursor-abort-pairing-fixture",
+		name: "Cursor abort pairing fixture",
+		api: "cursor-agent",
+		provider: "cursor",
+		baseUrl: `http://127.0.0.1:${address.port}`,
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1000,
+		maxTokens: 100,
+	});
+	const opened = Promise.withResolvers<void>();
+	const mock = createMockModel({ responses: [{ content: ["continued"] }] });
+	let continuation: Message[] = [];
+	let calls = 0;
+	const agent = new Agent({
+		initialState: { model },
+		streamFn: (model, context, options) => {
+			if (++calls > 1) {
+				continuation = context.messages;
+				return mock.stream(mock.model, context, options);
+			}
+			return streamCursor(model, context, {
+				...options,
+				onToolResult: options?.cursorOnToolResult,
+				apiKey: "test-token",
+				transport: "http2",
+			});
+		},
+	});
+	agent.subscribe(event => {
+		if (event.type === "message_update" && event.assistantMessageEvent.type === "toolcall_start") opened.resolve();
+	});
+	const running = agent.prompt("start hosted call");
+	try {
+		await opened.promise;
+		agent.abort();
+		await running;
+		const paired = agent.state.messages.filter(message => message.role === "toolResult");
+		expect(paired.map(message => message.toolCallId)).toEqual(["open-hosted"]);
+		expect(paired[0]?.isError).toBe(true);
+		await agent.continue();
+		expect(
+			continuation.flatMap(message =>
+				message.role === "assistant"
+					? message.content.flatMap(block => (block.type === "toolCall" ? [block.id] : []))
+					: [],
+			),
+		).toEqual(["open-hosted"]);
+		expect(continuation.flatMap(message => (message.role === "toolResult" ? [message.toolCallId] : []))).toEqual([
+			"open-hosted",
+		]);
+	} finally {
+		agent.abort();
+		await running;
 		for (const session of sessions) session.destroy();
 		server.close();
 	}
