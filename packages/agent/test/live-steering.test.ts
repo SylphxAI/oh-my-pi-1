@@ -1,3 +1,15 @@
+import * as http2 from "node:http2";
+import { streamCursor } from "@oh-my-pi/pi-ai/providers/cursor";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import {
+	AgentServerMessageSchema,
+	ConnectScmArgsSchema,
+	ConnectScmToolCallSchema,
+	ToolCallSchema,
+	InteractionUpdateSchema,
+	ToolCallStartedUpdateSchema,
+} from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
+import { create, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Agent } from "@oh-my-pi/pi-agent-core";
@@ -398,4 +410,119 @@ describe("agent loop live steering", () => {
 		expect(ended.flatMap(userTexts)).toEqual(["start"]);
 		expect(agent.peekSteeringQueue()).toEqual([]);
 	});
+});
+
+function frame(data: Uint8Array): Buffer {
+	const result = Buffer.alloc(5 + data.length);
+	result.writeUInt32BE(data.length, 1);
+	result.set(data, 5);
+	return result;
+}
+
+it("pairs an open hosted call on cancellation in the agent transcript and continuation", async () => {
+	const sessions = new Set<http2.ServerHttp2Session>();
+	const server = http2.createServer();
+	server.on("session", session => {
+		sessions.add(session);
+		session.on("close", () => sessions.delete(session));
+	});
+	server.on("stream", (socket: http2.ServerHttp2Stream) => {
+		socket.respond({ ":status": 200, "content-type": "application/connect+proto" });
+		socket.once("data", () => {
+			const toolCall = create(ToolCallSchema, {
+				tool: {
+					case: "connectScmToolCall",
+					value: create(ConnectScmToolCallSchema, {
+						args: create(ConnectScmArgsSchema, { toolCallId: "open-hosted" }),
+					}),
+				},
+			});
+			socket.write(
+				frame(
+					toBinary(
+						AgentServerMessageSchema,
+						create(AgentServerMessageSchema, {
+							message: {
+								case: "interactionUpdate",
+								value: create(InteractionUpdateSchema, {
+									message: {
+										case: "toolCallStarted",
+										value: create(ToolCallStartedUpdateSchema, {
+											callId: "open-hosted",
+											toolCall,
+										}),
+									},
+								}),
+							},
+						}),
+					),
+				),
+			);
+		});
+	});
+	const listening = Promise.withResolvers<void>();
+	server.once("listening", listening.resolve);
+	server.listen(0, "127.0.0.1");
+	await listening.promise;
+	const address = server.address();
+	if (!address || typeof address === "string") throw new Error("missing fixture address");
+	const model = buildModel({
+		id: "cursor-abort-pairing-fixture",
+		name: "Cursor abort pairing fixture",
+		api: "cursor-agent",
+		provider: "cursor",
+		baseUrl: `http://127.0.0.1:${address.port}`,
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1000,
+		maxTokens: 100,
+	});
+	const opened = Promise.withResolvers<void>();
+	const mock = createMockModel({ responses: [{ content: ["continued"] }] });
+	let continuation: Message[] = [];
+	let calls = 0;
+	const agent = new Agent({
+		initialState: { model },
+		streamFn: (_model, context, options) => {
+			if (++calls > 1) {
+				continuation = context.messages;
+				return mock.stream(mock.model, context, options);
+			}
+			return streamCursor(model, context, {
+				...options,
+				onToolResult: options?.cursorOnToolResult,
+				apiKey: "test-token",
+				transport: "http2",
+			});
+		},
+	});
+	agent.subscribe(event => {
+		if (event.type === "message_update" && event.assistantMessageEvent.type === "toolcall_start") opened.resolve();
+	});
+	const running = agent.prompt("start hosted call");
+	try {
+		await opened.promise;
+		agent.abort();
+		await running;
+		const paired = agent.state.messages.filter(message => message.role === "toolResult");
+		expect(paired.map(message => message.toolCallId)).toEqual(["open-hosted"]);
+		expect(paired[0]?.isError).toBe(true);
+		await agent.continue();
+		expect(
+			continuation.flatMap(message =>
+				message.role === "assistant"
+					? message.content.flatMap(block => (block.type === "toolCall" ? [block.id] : []))
+					: [],
+			),
+		).toEqual(["open-hosted"]);
+		expect(continuation.flatMap(message => (message.role === "toolResult" ? [message.toolCallId] : []))).toEqual([
+			"open-hosted",
+		]);
+	} finally {
+		agent.abort();
+		await running;
+		for (const session of sessions) session.destroy();
+		server.close();
+	}
 });
