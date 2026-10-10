@@ -7,6 +7,7 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
 	AgentClientMessageSchema,
 	AgentServerMessageSchema,
+	ConversationStateStructureSchema,
 	FetchArgsSchema,
 	InteractionQuerySchema,
 	WebFetchRequestQuerySchema,
@@ -217,6 +218,7 @@ it.each([
 	"late-abort",
 	"ended-abort",
 	"interrupted-abort",
+	"interrupted-checkpoint",
 	"ended-hook-abort",
 	"interrupted-hook-abort",
 ])("settles delayed hosted steering before %s finalization", async mode => {
@@ -317,7 +319,13 @@ it.each([
 						},
 					}),
 				];
-				if (continuation || mode === "ordered" || mode === "query" || mode === "late-abort")
+				if (
+					continuation ||
+					mode === "ordered" ||
+					mode === "query" ||
+					mode === "late-abort" ||
+					mode === "interrupted-checkpoint"
+				)
 					updates.push(
 						create(InteractionUpdateSchema, {
 							message: {
@@ -388,6 +396,23 @@ it.each([
 				socket.write(Buffer.concat(frames));
 				return;
 			}
+			if (mode === "interrupted-checkpoint")
+				frames.push(
+					frame(
+						toBinary(
+							AgentServerMessageSchema,
+							create(AgentServerMessageSchema, {
+								message: {
+									case: "conversationCheckpointUpdate",
+									value: create(ConversationStateStructureSchema, {
+										rootPromptMessagesJson: [Uint8Array.of(1)],
+										turns: [Uint8Array.of(2)],
+									}),
+								},
+							}),
+						),
+					),
+				);
 			if (!interrupted)
 				frames.push(
 					frame(
@@ -434,6 +459,7 @@ it.each([
 				apiKey: "test-token",
 				transport: "http2",
 				signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]),
+				providerRetryWait: async () => {},
 				liveSteering: steering,
 				execHandlers: {
 					read: async args => {
@@ -473,9 +499,12 @@ it.each([
 			expect(finished).toBe(true);
 			expect((await result).stopReason).toBe("aborted");
 			if (mode === "late-abort") {
+				const snapshot = [...steering.deferred];
+				expect(snapshot.map(message => message.content)).toEqual(["A"]);
+				expect(pending).toEqual([]);
 				const next = await streamCursor(
 					model,
-					{ messages: [{ role: "user", content: "continue", timestamp: 3 }] },
+					{ messages: snapshot as UserMessage[] },
 					{
 						apiKey: "test-token",
 						transport: "http2",
@@ -494,6 +523,7 @@ it.each([
 				setImmediate(settled.resolve);
 				await settled.promise;
 				expect(sink).toEqual(["A", "C"]);
+				expect(steering.deferred).toEqual(snapshot);
 			}
 			return;
 		}
@@ -517,12 +547,13 @@ it.each([
 		expect(steering.deferred).toEqual([]);
 		releaseConversion.resolve();
 		const message = await result;
-		expect(message.stopReason).toBe(mode === "interrupted" ? "error" : "toolUse");
+		expect(message.stopReason).toBe("toolUse");
 		expect([...steering.deferred, ...pending].map(message => message.content)).toEqual(
 			mode === "ordered" ? ["A", "B"] : ["A"],
 		);
 		expect(steering.accepted).toEqual([]);
 		expect(approvals).toBe(0);
+		if (mode === "interrupted-checkpoint") expect(runs).toBe(1);
 	} finally {
 		releaseConversion.resolve();
 		releaseLaterConversion.resolve();

@@ -1671,6 +1671,7 @@ function streamCursorWithWireMode(
 			const repeatedCheckpoint = checkpointHash !== undefined && checkpointHash === retryContext?.checkpointHash;
 			const noProgressResumes = repeatedCheckpoint ? (retryContext?.noProgressResumes ?? 0) + 1 : 0;
 			const canRetryFromCheckpoint =
+				!yieldedForSteering &&
 				replaySafe &&
 				!options?.signal?.aborted &&
 				retryAttempt < CURSOR_MAX_STREAM_RETRIES &&
@@ -1766,6 +1767,16 @@ function streamCursorWithWireMode(
 				flushOpenToolCalls(output, stream, openBlockState);
 				await drainInFlightDispatches();
 				if (yieldedForSteering && conversationId) cursorConversations.delete(conversationId);
+			}
+			if (yieldedForSteering && !options?.signal?.aborted) {
+				// A transport failure may win the race with the steering callback.
+				// Once its drain yields, finish at the agent boundary, not the checkpoint.
+				calculateCost(model, output.usage, output.timestamp);
+				output.duration = performance.now() - startTime;
+				if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+				stream.push({ type: "done", reason: "toolUse", message: output });
+				stream.end();
+				return;
 			}
 			const result = await AIError.finalize(error, { api: model.api, signal: options?.signal });
 			// #8345: a server-side per-conversation rejection surfaces as a bare

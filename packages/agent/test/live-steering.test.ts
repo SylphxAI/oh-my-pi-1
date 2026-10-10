@@ -14,6 +14,7 @@ import type {
 import type { LiveSteering, Message } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { LiveSteeringChannel } from "../src/live-steering";
 import { createUserMessage } from "./helpers";
 
 /** Marks user text so tests can see the provider received the converted view. */
@@ -238,6 +239,65 @@ describe("agent loop live steering", () => {
 
 		expect(agent.peekLiveSteeredMessages()).toEqual([]);
 		expect(agent.peekSteeringQueue()).toEqual([steer]);
+	});
+
+	it("snapshots a converting claim on abort and delivers it once on continuation", async () => {
+		const converting = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const mock = createMockModel({ responses: [{ content: ["continued"] }] });
+		let claim: Promise<void> | undefined;
+		let channel: LiveSteeringChannel | undefined;
+		let calls = 0;
+		const contexts: string[][] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model },
+			convertToLlm: async messages => {
+				if (messages.length === 1 && userText(messages[0]) === "use tabs") {
+					converting.resolve();
+					await release.promise;
+				}
+				return convertToLlm(messages);
+			},
+			streamFn: async (model, context, options) => {
+				contexts.push(context.messages.map(textOf));
+				if (++calls !== 1) return mock.stream(model, context, options);
+				const live = options?.liveSteering;
+				const signal = options?.signal;
+				if (!(live instanceof LiveSteeringChannel) || !signal) throw new Error("missing steering channel");
+				channel = live;
+				const stream = new AssistantMessageEventStream();
+				// The provider cancellation completes without waiting for conversion.
+				signal.addEventListener("abort", () => stream.fail(new Error("aborted")), { once: true });
+				claim = live.wait(signal).then(async () => {
+					(await live.claim(signal))?.reject();
+				});
+				return stream;
+			},
+		});
+		const steer = createUserMessage("use tabs");
+		const running = agent.prompt("start");
+		agent.steer(steer);
+		await converting.promise;
+		try {
+			agent.abort();
+			await running;
+			// Read at the same terminal boundary as agent-loop's deferred snapshot,
+			// before the abandoned conversion is allowed to finish.
+			const snapshot = [...(channel?.deferred ?? [])];
+			expect(snapshot).toEqual([steer]);
+			expect(agent.peekSteeringQueue()).toEqual([steer]);
+			await claim;
+			release.resolve();
+			await agent.continue();
+			await claim;
+			expect(contexts[1].filter(text => text === "<user>use tabs</user>")).toHaveLength(1);
+			expect(channel?.deferred).toEqual(snapshot);
+			expect(channel?.accepted).toEqual([]);
+			expect(agent.peekSteeringQueue()).toEqual([]);
+		} finally {
+			release.resolve();
+			await claim;
+		}
 	});
 
 	it("drops withdrawn live steering from the aborted run", async () => {
