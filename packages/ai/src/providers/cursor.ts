@@ -1089,6 +1089,7 @@ function streamCursorWithWireMode(
 		const h2Completion = Promise.withResolvers<void>();
 		let h2Settled = false;
 		let sawTurnEnded = false;
+		let yieldedForSteering = false;
 		// After the final step's `stepCompleted`, only a repeat checkpoint and the
 		// `turnEnded` usage frame follow.
 		let stepCompletedIsLatest = false;
@@ -1274,6 +1275,26 @@ function streamCursorWithWireMode(
 			const resolvedMcpToolCallIds = previousState?.resolvedMcpToolCallIds ?? new Set<string>();
 			usageState = retryContext?.usageState ?? { sawTokenDelta: false };
 
+			const steeringSignal = options?.signal ?? new AbortController().signal;
+			const onToolResult: CursorToolResultHandler = async toolResult => {
+				const result = (await options?.onToolResult?.(toolResult)) ?? toolResult;
+				if (!yieldedForSteering && options?.liveSteering) {
+					const claim = await options.liveSteering.claim(steeringSignal);
+					if (claim) {
+						// Cursor owns the tool loop inside this stream. Yield before replying
+						// with this result, so it cannot start the next tool before the agent
+						// injects queued input. Keep the completed tool's local result paired.
+						claim.reject();
+						yieldedForSteering = true;
+						output.stopReason = "toolUse";
+						h2Settled = true;
+						h2Completion.resolve();
+						runTransport?.close();
+					}
+				}
+				return result;
+			};
+
 			const state: BlockState = {
 				get currentTextBlock() {
 					return currentTextBlock;
@@ -1302,7 +1323,7 @@ function streamCursorWithWireMode(
 					if (!firstTokenTime) firstTokenTime = performance.now();
 				},
 				onTodoSnapshot: options?.execHandlers?.todoSync?.bind(options.execHandlers),
-				onToolResult: options?.onToolResult,
+				onToolResult,
 			};
 			openBlockState = state;
 
@@ -1320,6 +1341,7 @@ function streamCursorWithWireMode(
 			const resultTransport = runTransport;
 			const resultWriter: CursorMessageWriter = {
 				write(frame) {
+					if (yieldedForSteering) return;
 					progressVersion++;
 					resultTransport.write(frame);
 				},
@@ -1340,6 +1362,7 @@ function streamCursorWithWireMode(
 					});
 				}
 				for (const { flags, payload: messageBytes } of frameDecoder.decode(chunk)) {
+					if (yieldedForSteering) break;
 					if (flags & CONNECT_END_STREAM_FLAG) {
 						const endError = parseConnectEndStream(messageBytes);
 						if (endError) {
@@ -1397,7 +1420,7 @@ function streamCursorWithWireMode(
 							blobStore,
 							serverMessage.message.case === "kvServerMessage" ? runTransport! : resultWriter,
 							options?.execHandlers,
-							options?.onToolResult,
+							onToolResult,
 							usageState!,
 							requestContextTools,
 							requestContextRules,
@@ -1485,6 +1508,11 @@ function streamCursorWithWireMode(
 			// unpaired and stripped from every rebuilt transcript. Each dispatch
 			// already swallows its own rejection, so this only waits.
 			await drainInFlightDispatches();
+			if (yieldedForSteering && conversationId) {
+				// The server never received the last result. Its checkpoint would replay
+				// that tool; rebuild the next request from the paired local transcript.
+				cursorConversations.delete(conversationId);
+			}
 
 			endCurrentTextBlock(output, stream, state);
 			endCurrentThinkingBlock(output, stream, state);

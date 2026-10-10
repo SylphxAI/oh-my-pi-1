@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed queued user messages waiting until the entire Cursor tool chain finishes instead of reaching the next model turn after the current tool.
+
 ## [18.8.7] - 2026-10-09
 
 ### Added
