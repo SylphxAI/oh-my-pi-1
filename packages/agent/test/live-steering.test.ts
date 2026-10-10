@@ -1,3 +1,16 @@
+import * as http2 from "node:http2";
+import { streamCursor } from "@oh-my-pi/pi-ai/providers/cursor";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import {
+	AgentServerMessageSchema,
+	ConnectScmArgsSchema,
+	ConnectScmToolCallSchema,
+	ToolCallSchema,
+	InteractionUpdateSchema,
+	ToolCallStartedUpdateSchema,
+	ToolCallCompletedUpdateSchema,
+} from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
+import { create, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Agent } from "@oh-my-pi/pi-agent-core";
@@ -14,6 +27,8 @@ import type {
 import type { LiveSteering, Message } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { CodexSteerPump, type CodexSteerAck } from "../../ai/src/providers/openai-codex/live-steering";
+import { LiveSteeringChannel } from "../src/live-steering";
 import { createUserMessage } from "./helpers";
 
 /** Marks user text so tests can see the provider received the converted view. */
@@ -127,6 +142,41 @@ function userText(message: AgentMessage): string {
 }
 
 describe("agent loop live steering", () => {
+	it("records a submitted Codex steer accepted after finish stops claiming", async () => {
+		const steer = createUserMessage("use tabs");
+		const queue = [steer];
+		const channel = new LiveSteeringChannel({
+			wait: async () => {},
+			take: async () => queue.splice(0),
+			toProvider: async () => [steer],
+		});
+		const submitted = Promise.withResolvers<void>();
+		const acknowledgement = Promise.withResolvers<CodexSteerAck>();
+		const pump = new CodexSteerPump(
+			channel,
+			{
+				steer: async () => {
+					submitted.resolve();
+					return acknowledgement.promise;
+				},
+			},
+			() => [{ role: "user", content: "use tabs" }],
+		);
+		pump.start("response-1");
+		await submitted.promise;
+		const finishing = pump.finish();
+		try {
+			expect(channel.deferred).toEqual([]);
+		} finally {
+			acknowledgement.resolve({ accepted: true, id: "steer-1" });
+			await finishing;
+		}
+		const outcome = await finishing;
+		expect(outcome.accepted.map(input => input.id)).toEqual(["steer-1"]);
+		expect(channel.accepted).toEqual([steer]);
+		expect(channel.deferred).toEqual([]);
+		expect(queue).toEqual([]);
+	});
 	it("records accepted steering right after the steered response and holds later input for the next boundary", async () => {
 		let claimedView: string[] | undefined;
 		const { contexts, transcript } = await runSteered(async (live, queue) => {
@@ -240,6 +290,65 @@ describe("agent loop live steering", () => {
 		expect(agent.peekSteeringQueue()).toEqual([steer]);
 	});
 
+	it("snapshots a converting claim on abort and delivers it once on continuation", async () => {
+		const converting = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const mock = createMockModel({ responses: [{ content: ["continued"] }] });
+		let claim: Promise<void> | undefined;
+		let channel: LiveSteeringChannel | undefined;
+		let calls = 0;
+		const contexts: string[][] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model },
+			convertToLlm: async messages => {
+				if (messages.length === 1 && userText(messages[0]) === "use tabs") {
+					converting.resolve();
+					await release.promise;
+				}
+				return convertToLlm(messages);
+			},
+			streamFn: async (model, context, options) => {
+				contexts.push(context.messages.map(textOf));
+				if (++calls !== 1) return mock.stream(model, context, options);
+				const live = options?.liveSteering;
+				const signal = options?.signal;
+				if (!(live instanceof LiveSteeringChannel) || !signal) throw new Error("missing steering channel");
+				channel = live;
+				const stream = new AssistantMessageEventStream();
+				// The provider cancellation completes without waiting for conversion.
+				signal.addEventListener("abort", () => stream.fail(new Error("aborted")), { once: true });
+				claim = live.wait(signal).then(async () => {
+					(await live.claim(signal))?.reject();
+				});
+				return stream;
+			},
+		});
+		const steer = createUserMessage("use tabs");
+		const running = agent.prompt("start");
+		agent.steer(steer);
+		await converting.promise;
+		try {
+			agent.abort();
+			await running;
+			// Read at the same terminal boundary as agent-loop's deferred snapshot,
+			// before the abandoned conversion is allowed to finish.
+			const snapshot = [...(channel?.deferred ?? [])];
+			expect(snapshot).toEqual([steer]);
+			expect(agent.peekSteeringQueue()).toEqual([steer]);
+			await claim;
+			release.resolve();
+			await agent.continue();
+			await claim;
+			expect(contexts[1].filter(text => text === "<user>use tabs</user>")).toHaveLength(1);
+			expect(channel?.deferred).toEqual(snapshot);
+			expect(channel?.accepted).toEqual([]);
+			expect(agent.peekSteeringQueue()).toEqual([]);
+		} finally {
+			release.resolve();
+			await claim;
+		}
+	});
+
 	it("drops withdrawn live steering from the aborted run", async () => {
 		// Esc hands the steer back to the editor: the abort must neither requeue nor record it.
 		const { agent, steer, running } = await startLiveSteeredRun();
@@ -303,3 +412,155 @@ describe("agent loop live steering", () => {
 		expect(agent.peekSteeringQueue()).toEqual([]);
 	});
 });
+
+function frame(data: Uint8Array): Buffer {
+	const result = Buffer.alloc(5 + data.length);
+	result.writeUInt32BE(data.length, 1);
+	result.set(data, 5);
+	return result;
+}
+
+it.each(["open", "completed"])(
+	"pairs %s hosted calls on cancellation in the agent transcript and continuation",
+	async mode => {
+		const callIds = mode === "open" ? ["open-hosted"] : ["A", "B"];
+		const converting = Promise.withResolvers<void>();
+		const releaseConversion = Promise.withResolvers<void>();
+		const sink: string[] = [];
+		const sessions = new Set<http2.ServerHttp2Session>();
+		const server = http2.createServer();
+		server.on("session", session => {
+			sessions.add(session);
+			session.on("close", () => sessions.delete(session));
+		});
+		server.on("stream", (socket: http2.ServerHttp2Stream) => {
+			socket.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			socket.once("data", () => {
+				const frames: Buffer[] = [];
+				for (const callId of callIds) {
+					const toolCall = create(ToolCallSchema, {
+						tool: {
+							case: "connectScmToolCall",
+							value: create(ConnectScmToolCallSchema, {
+								args: create(ConnectScmArgsSchema, { toolCallId: callId }),
+							}),
+						},
+					});
+					const updates = [
+						create(InteractionUpdateSchema, {
+							message: {
+								case: "toolCallStarted",
+								value: create(ToolCallStartedUpdateSchema, { callId, toolCall }),
+							},
+						}),
+					];
+					if (mode === "completed")
+						updates.push(
+							create(InteractionUpdateSchema, {
+								message: {
+									case: "toolCallCompleted",
+									value: create(ToolCallCompletedUpdateSchema, { callId, toolCall }),
+								},
+							}),
+						);
+					for (const value of updates)
+						frames.push(
+							frame(
+								toBinary(
+									AgentServerMessageSchema,
+									create(AgentServerMessageSchema, { message: { case: "interactionUpdate", value } }),
+								),
+							),
+						);
+				}
+				socket.write(Buffer.concat(frames));
+			});
+		});
+		const listening = Promise.withResolvers<void>();
+		server.once("listening", listening.resolve);
+		server.listen(0, "127.0.0.1");
+		await listening.promise;
+		const address = server.address();
+		if (!address || typeof address === "string") throw new Error("missing fixture address");
+		const model = buildModel({
+			id: "cursor-abort-pairing-fixture",
+			name: "Cursor abort pairing fixture",
+			api: "cursor-agent",
+			provider: "cursor",
+			baseUrl: `http://127.0.0.1:${address.port}`,
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1000,
+			maxTokens: 100,
+		});
+		const opened = Promise.withResolvers<void>();
+		const mock = createMockModel({ responses: [{ content: ["continued"] }] });
+		let continuation: Message[] = [];
+		let calls = 0;
+		const agent = new Agent({
+			initialState: { model },
+			convertToLlm: async messages => {
+				if (messages.length === 1 && userText(messages[0]) === "use tabs") {
+					converting.resolve();
+					await releaseConversion.promise;
+				}
+				return convertToLlm(messages);
+			},
+			streamFn: (_model, context, options) => {
+				if (++calls > 1) {
+					continuation = context.messages;
+					return mock.stream(mock.model, context, options);
+				}
+				return streamCursor(model, context, {
+					...options,
+					onToolResult: toolResult => {
+						sink.push(toolResult.toolCallId);
+						return options?.cursorOnToolResult?.(toolResult) ?? toolResult;
+					},
+					apiKey: "test-token",
+					transport: "http2",
+				});
+			},
+		});
+		agent.subscribe(event => {
+			if (event.type === "message_update" && event.assistantMessageEvent.type === "toolcall_start") opened.resolve();
+		});
+		const running = agent.prompt("start hosted call");
+		try {
+			if (mode === "completed") {
+				agent.steer(createUserMessage("use tabs"));
+				await converting.promise;
+			} else await opened.promise;
+			agent.abort();
+			await running;
+			const paired = agent.state.messages.filter(message => message.role === "toolResult");
+			expect(paired.map(message => message.toolCallId)).toEqual(callIds);
+			if (mode === "open") expect(paired[0]?.isError).toBe(true);
+			await agent.continue();
+			expect(
+				continuation.flatMap(message =>
+					message.role === "assistant"
+						? message.content.flatMap(block => (block.type === "toolCall" ? [block.id] : []))
+						: [],
+				),
+			).toEqual(callIds);
+			expect(continuation.flatMap(message => (message.role === "toolResult" ? [message.toolCallId] : []))).toEqual(
+				callIds,
+			);
+			const snapshot = [...agent.state.messages];
+			releaseConversion.resolve();
+			const settled = Promise.withResolvers<void>();
+			setImmediate(settled.resolve);
+			await settled.promise;
+			expect(sink).toEqual(callIds);
+			expect(agent.state.messages).toEqual(snapshot);
+		} finally {
+			releaseConversion.resolve();
+			agent.abort();
+			await running;
+			for (const session of sessions) session.destroy();
+			server.close();
+		}
+	},
+);

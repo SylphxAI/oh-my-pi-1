@@ -36,6 +36,10 @@ export class LiveSteeringChannel implements LiveSteering {
 		this.#queue = queue;
 	}
 
+	get hasDeferred(): boolean {
+		return this.deferred.length > 0;
+	}
+
 	wait(signal: AbortSignal): Promise<void> {
 		// Once input is deferred, later input must follow it at the boundary;
 		// delivering it live would reorder the user's messages.
@@ -59,31 +63,50 @@ export class LiveSteeringChannel implements LiveSteering {
 			return undefined;
 		}
 		if (messages.length === 0) return undefined;
+		let settled = false;
+		const cancelled = Promise.withResolvers<undefined>();
+		const reject = () => {
+			if (settled) return;
+			settled = true;
+			signal.removeEventListener("abort", onAbort);
+			this.deferred.push(...messages);
+		};
+		const onAbort = () => {
+			// The agent snapshots this channel as soon as the stream ends. Restore
+			// dequeued input synchronously, not after an abandoned conversion settles.
+			reject();
+			cancelled.resolve(undefined);
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		if (signal.aborted) {
+			onAbort();
+			return undefined;
+		}
 		let providerMessages: UserMessage[] | undefined;
 		try {
-			providerMessages = await this.#queue.toProvider(messages, signal);
+			providerMessages = await Promise.race([this.#queue.toProvider(messages, signal), cancelled.promise]);
 		} catch (error) {
 			logger.debug("Live steering conversion failed", {
 				error: error instanceof Error ? error.message : String(error),
 			});
+		} finally {
+			// Cancellation restores input only while conversion owns it. Once handed
+			// to the provider, its submission acknowledgement owns settlement.
+			signal.removeEventListener("abort", onAbort);
 		}
-		if (!providerMessages) {
-			this.deferred.push(...messages);
+		if (!providerMessages || settled) {
+			reject();
 			return undefined;
 		}
-		let settled = false;
 		return {
 			messages: providerMessages,
 			accept: () => {
 				if (settled) return;
 				settled = true;
+				signal.removeEventListener("abort", onAbort);
 				this.accepted.push(...messages);
 			},
-			reject: () => {
-				if (settled) return;
-				settled = true;
-				this.deferred.push(...messages);
-			},
+			reject,
 		};
 	}
 }

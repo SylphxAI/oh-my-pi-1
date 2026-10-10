@@ -728,6 +728,8 @@ export interface StreamOptions {
  * response streams. See {@link StreamOptions.liveSteering}.
  */
 export interface LiveSteering {
+	/** Input already taken but deferred to the next model request. */
+	readonly hasDeferred?: boolean;
 	/** Resolves once steering may be claimable, or when `signal` aborts. Never consumes input. */
 	wait(signal: AbortSignal): Promise<void>;
 	/** Takes the queued steering as provider messages; `undefined` when none is deliverable now. */

@@ -1050,6 +1050,8 @@ function streamCursorWithWireMode(
 		// transport fails, and the error path finalizes the synthesized call just
 		// like the success path does.
 		const inFlightDispatches = new Set<Promise<void>>();
+		const toolResultCallbacks = new Set<Promise<void>>();
+		let finalized = false;
 		// A dispatch can spawn another (a handler that decodes a nested frame), so
 		// re-check rather than awaiting one snapshot. Each dispatch already
 		// swallows its own rejection, so this only waits.
@@ -1089,6 +1091,7 @@ function streamCursorWithWireMode(
 		const h2Completion = Promise.withResolvers<void>();
 		let h2Settled = false;
 		let sawTurnEnded = false;
+		let yieldedForSteering = false;
 		// After the final step's `stepCompleted`, only a repeat checkpoint and the
 		// `turnEnded` usage frame follow.
 		let stepCompletedIsLatest = false;
@@ -1106,6 +1109,17 @@ function streamCursorWithWireMode(
 		// and pair the blocks it left open, and `state` itself is scoped to the
 		// try below.
 		let openBlockState: BlockState | undefined;
+		// Abort cannot wait behind an abandoned hook/conversion. Reserve synthetic
+		// interrupted results in the agent sink now, before its transcript closes;
+		// ordinary queued callbacks still retain the abort/finalized guard.
+		const onInterruptedToolResult: CursorToolResultHandler = async toolResult => {
+			try {
+				return (await options?.onToolResult?.(toolResult)) ?? toolResult;
+			} catch (error) {
+				log("error", "toolResult", { error: String(error) });
+				return toolResult;
+			}
+		};
 		const settleH2 = (error?: unknown): void => {
 			if (h2Settled) return;
 			h2Settled = true;
@@ -1274,6 +1288,49 @@ function streamCursorWithWireMode(
 			const resolvedMcpToolCallIds = previousState?.resolvedMcpToolCallIds ?? new Set<string>();
 			usageState = retryContext?.usageState ?? { sawTokenDelta: false };
 
+			const steeringSignal = options?.signal ?? new AbortController().signal;
+			let toolResultTail: Promise<void> = Promise.resolve();
+			const onToolResult: CursorToolResultHandler = toolResult => {
+				if (finalized || options?.signal?.aborted) return Promise.resolve(toolResult);
+				const previousResult = toolResultTail;
+				const completion = (async () => {
+					// Reserve completed results in the owning run synchronously, before
+					// another result's steering conversion can delay their delivery.
+					const result = (await options?.onToolResult?.(toolResult)) ?? toolResult;
+					// Only steering claim and settlement need serialization.
+					await previousResult;
+					if (!finalized && !options?.signal?.aborted && !yieldedForSteering && options?.liveSteering) {
+						const claim = await options.liveSteering.claim(steeringSignal);
+						if (claim || options.liveSteering.hasDeferred) {
+							// Cursor owns the tool loop inside this stream. Yield before replying
+							// with this result, so it cannot start the next tool before the agent
+							// injects queued input. Keep the completed tool's local result paired.
+							claim?.reject();
+							if (finalized || options?.signal?.aborted) return result;
+							yieldedForSteering = true;
+							output.stopReason = "toolUse";
+							h2Settled = true;
+							h2Completion.resolve();
+							runTransport?.close();
+						}
+					}
+					return result;
+				})();
+				toolResultTail = completion.then(
+					() => {},
+					error => log("error", "toolResult", { error: String(error) }),
+				);
+				// Local execs and hosted completions share the same dispatch boundary.
+				const settled = toolResultTail;
+				toolResultCallbacks.add(settled);
+				inFlightDispatches.add(settled);
+				void settled.finally(() => {
+					toolResultCallbacks.delete(settled);
+					inFlightDispatches.delete(settled);
+				});
+				return completion;
+			};
+
 			const state: BlockState = {
 				get currentTextBlock() {
 					return currentTextBlock;
@@ -1302,7 +1359,7 @@ function streamCursorWithWireMode(
 					if (!firstTokenTime) firstTokenTime = performance.now();
 				},
 				onTodoSnapshot: options?.execHandlers?.todoSync?.bind(options.execHandlers),
-				onToolResult: options?.onToolResult,
+				onToolResult,
 			};
 			openBlockState = state;
 
@@ -1320,6 +1377,7 @@ function streamCursorWithWireMode(
 			const resultTransport = runTransport;
 			const resultWriter: CursorMessageWriter = {
 				write(frame) {
+					if (finalized || yieldedForSteering || options?.signal?.aborted) return;
 					progressVersion++;
 					resultTransport.write(frame);
 				},
@@ -1340,6 +1398,7 @@ function streamCursorWithWireMode(
 					});
 				}
 				for (const { flags, payload: messageBytes } of frameDecoder.decode(chunk)) {
+					if (yieldedForSteering) break;
 					if (flags & CONNECT_END_STREAM_FLAG) {
 						const endError = parseConnectEndStream(messageBytes);
 						if (endError) {
@@ -1389,21 +1448,34 @@ function streamCursorWithWireMode(
 						// drains its Cursor result buffer before the handler reserved its
 						// entry and the call is left unpaired. Awaited after
 						// `h2Completion` below.
-						const dispatch = handleServerMessage(
-							serverMessage,
-							output,
-							stream,
-							state,
-							blobStore,
-							serverMessage.message.case === "kvServerMessage" ? runTransport! : resultWriter,
-							options?.execHandlers,
-							options?.onToolResult,
-							usageState!,
-							requestContextTools,
-							requestContextRules,
-							onConversationCheckpoint,
-							options?.externalToolExecutor,
-						).catch(error => {
+						const dispatch = (async () => {
+							if (
+								serverMessage.message.case === "execServerMessage" ||
+								serverMessage.message.case === "interactionQuery"
+							) {
+								// Later completions in the same chunk can queue more callbacks
+								// while this dispatch waits. Reach a fixed point before proceeding.
+								while (toolResultCallbacks.size > 0) {
+									await Promise.all(toolResultCallbacks);
+									if (yieldedForSteering || options?.signal?.aborted) return;
+								}
+							}
+							await handleServerMessage(
+								serverMessage,
+								output,
+								stream,
+								state,
+								blobStore,
+								serverMessage.message.case === "kvServerMessage" ? runTransport! : resultWriter,
+								options?.execHandlers,
+								onToolResult,
+								usageState!,
+								requestContextTools,
+								requestContextRules,
+								onConversationCheckpoint,
+								options?.externalToolExecutor,
+							);
+						})().catch(error => {
 							log("error", "handleServerMessage", { error: String(error) });
 						});
 						inFlightDispatches.add(dispatch);
@@ -1485,10 +1557,19 @@ function streamCursorWithWireMode(
 			// unpaired and stripped from every rebuilt transcript. Each dispatch
 			// already swallows its own rejection, so this only waits.
 			await drainInFlightDispatches();
-
 			endCurrentTextBlock(output, stream, state);
 			endCurrentThinkingBlock(output, stream, state);
-			flushOpenToolCalls(output, stream, state);
+			flushOpenToolCalls(
+				output,
+				stream,
+				state,
+				options?.signal?.aborted ? onInterruptedToolResult : state.onToolResult,
+			);
+			// Flushing server-owned calls creates result callbacks after the dispatch
+			// drain. Settle their claims before the agent snapshots queued input.
+			await drainInFlightDispatches();
+			if (options?.signal?.aborted) throw new AIError.AbortError();
+			if (yieldedForSteering && conversationId) cursorConversations.delete(conversationId);
 
 			calculateCost(model, output.usage, output.timestamp);
 
@@ -1612,6 +1693,7 @@ function streamCursorWithWireMode(
 			const repeatedCheckpoint = checkpointHash !== undefined && checkpointHash === retryContext?.checkpointHash;
 			const noProgressResumes = repeatedCheckpoint ? (retryContext?.noProgressResumes ?? 0) + 1 : 0;
 			const canRetryFromCheckpoint =
+				!yieldedForSteering &&
 				replaySafe &&
 				!options?.signal?.aborted &&
 				retryAttempt < CURSOR_MAX_STREAM_RETRIES &&
@@ -1704,7 +1786,24 @@ function streamCursorWithWireMode(
 			if (openBlockState) {
 				endCurrentTextBlock(output, stream, openBlockState);
 				endCurrentThinkingBlock(output, stream, openBlockState);
-				flushOpenToolCalls(output, stream, openBlockState);
+				flushOpenToolCalls(
+					output,
+					stream,
+					openBlockState,
+					options?.signal?.aborted ? onInterruptedToolResult : openBlockState.onToolResult,
+				);
+				await drainInFlightDispatches();
+				if (yieldedForSteering && conversationId) cursorConversations.delete(conversationId);
+			}
+			if (yieldedForSteering && !options?.signal?.aborted) {
+				// A transport failure may win the race with the steering callback.
+				// Once its drain yields, finish at the agent boundary, not the checkpoint.
+				calculateCost(model, output.usage, output.timestamp);
+				output.duration = performance.now() - startTime;
+				if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+				stream.push({ type: "done", reason: "toolUse", message: output });
+				stream.end();
+				return;
 			}
 			const result = await AIError.finalize(error, { api: model.api, signal: options?.signal });
 			// #8345: a server-side per-conversation rejection surfaces as a bare
@@ -1751,6 +1850,7 @@ function streamCursorWithWireMode(
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		} finally {
+			finalized = true;
 			const log = await debugResponseLogPromise;
 			await log?.close();
 			if (heartbeatTimer) {
@@ -4512,6 +4612,7 @@ export function flushOpenToolCalls(
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 	state: BlockState,
+	onToolResult: CursorToolResultHandler | undefined = state.onToolResult,
 ): void {
 	const openBlocks = new Set<ToolCallState>(state.openToolCalls.values());
 	if (state.currentToolCall) openBlocks.add(state.currentToolCall);
@@ -4525,7 +4626,7 @@ export function flushOpenToolCalls(
 		const kind = block[kStreamingBlockKind];
 		if (kind === "connect-scm" || kind === "todo" || kind === "cursor-edit" || kind === "web-fetch") {
 			if (!(kind === "cursor-edit" && state.pairedEditToolCallIds?.has(block.id))) {
-				state.onToolResult?.({
+				onToolResult?.({
 					role: "toolResult",
 					toolCallId: block.id,
 					toolName: block.name,
