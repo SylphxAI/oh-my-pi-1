@@ -2387,21 +2387,6 @@ async function streamAssistantResponse(
 						case "toolcall_delta":
 						case "toolcall_end":
 							if (partialMessage) {
-								if (event.type === "toolcall_start") {
-									const toolCall = event.partial.content[event.contentIndex];
-									const kind = (toolCall as { [kStreamingBlockKind]?: string })?.[kStreamingBlockKind];
-									if (
-										toolCall?.type === "toolCall" &&
-										(kind === "connect-scm" ||
-											kind === "todo" ||
-											kind === "web-fetch" ||
-											kind === "cursor-edit")
-									) {
-										// Cursor pairs these server-owned calls during abort finalization.
-										// The abort race may stop reading before their toolcall_end arrives.
-										completedToolCallIds.add(toolCall.id);
-									}
-								}
 								if (event.type === "toolcall_start" && speculationCoordinator && speculationPlansFromStream) {
 									// Stream sessions plan from pre-transform arguments, exactly like
 									// direct candidates (see admitFinalized below): with a transformer
@@ -2612,7 +2597,15 @@ function retainCompletedToolCalls(
 	let droppedIncompleteToolCall = false;
 	const content = message.content.filter(block => {
 		if (block.type !== "toolCall") return true;
-		const keep = completedToolCallIds.has(block.id);
+		const kind = (block as { [kStreamingBlockKind]?: string })[kStreamingBlockKind];
+		// Cursor reserves hosted results before asynchronous steering and pairs open
+		// hosted calls during finalization, even if abort skips their queued events.
+		const keep =
+			completedToolCallIds.has(block.id) ||
+			kind === "connect-scm" ||
+			kind === "todo" ||
+			kind === "web-fetch" ||
+			kind === "cursor-edit";
 		if (!keep) droppedIncompleteToolCall = true;
 		return keep;
 	});

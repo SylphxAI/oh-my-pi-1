@@ -1291,11 +1291,14 @@ function streamCursorWithWireMode(
 			const steeringSignal = options?.signal ?? new AbortController().signal;
 			let toolResultTail: Promise<void> = Promise.resolve();
 			const onToolResult: CursorToolResultHandler = toolResult => {
-				// Serialize claim AND settlement: a later hosted completion must not
-				// dequeue input while an earlier message is still being converted.
-				const completion = toolResultTail.then(async () => {
-					if (finalized || options?.signal?.aborted) return toolResult;
+				if (finalized || options?.signal?.aborted) return Promise.resolve(toolResult);
+				const previousResult = toolResultTail;
+				const completion = (async () => {
+					// Reserve completed results in the owning run synchronously, before
+					// another result's steering conversion can delay their delivery.
 					const result = (await options?.onToolResult?.(toolResult)) ?? toolResult;
+					// Only steering claim and settlement need serialization.
+					await previousResult;
 					if (!finalized && !options?.signal?.aborted && !yieldedForSteering && options?.liveSteering) {
 						const claim = await options.liveSteering.claim(steeringSignal);
 						if (claim || options.liveSteering.hasDeferred) {
@@ -1312,7 +1315,7 @@ function streamCursorWithWireMode(
 						}
 					}
 					return result;
-				});
+				})();
 				toolResultTail = completion.then(
 					() => {},
 					error => log("error", "toolResult", { error: String(error) }),

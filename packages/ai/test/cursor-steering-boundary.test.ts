@@ -519,7 +519,7 @@ it.each([
 			if (mode === "late-abort") {
 				const snapshot = [...steering.deferred];
 				expect(snapshot.map(message => message.content)).toEqual(["A"]);
-				expect(pending).toEqual([]);
+				expect(pending.map(message => message.content)).toEqual(["B"]);
 				const next = await streamCursor(
 					model,
 					{ messages: snapshot as UserMessage[] },
@@ -534,13 +534,13 @@ it.each([
 					},
 				).result();
 				expect(next.stopReason).toBe("stop");
-				expect(sink).toEqual(["A", "C"]);
+				expect(sink).toEqual(["A", "B", "C"]);
 				releaseConversion.resolve();
 				releaseLaterConversion.resolve();
 				const settled = Promise.withResolvers<void>();
 				setImmediate(settled.resolve);
 				await settled.promise;
-				expect(sink).toEqual(["A", "C"]);
+				expect(sink).toEqual(["A", "B", "C"]);
 				expect(steering.deferred).toEqual(snapshot);
 			}
 			return;
